@@ -43,4 +43,4 @@ jobs:
       env:
         FIREBASE_CREDENTIALS: ${{ secrets.FIREBASE_CREDENTIALS }}
       run: |
-        python govisetha_auto_update.py
+        python main.py
