@@ -15,6 +15,8 @@ import re
 import firebase_admin
 from firebase_admin import credentials, firestore
 import logging
+from fake_useragent import UserAgent
+import random
 
 # Configure logging
 logging.basicConfig(
@@ -41,59 +43,179 @@ class GovisethaAutoUpdater:
     
     def __init__(self, firestore_client=None):
         self.firestore_client = firestore_client
+        self.ua = UserAgent()
         self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        self._update_headers()
+        
+    def _update_headers(self):
+        """Update headers with random user agent."""
+        headers = {
+            "User-Agent": self.ua.random,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
-        })
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+            "Referer": "https://www.google.com/",
+        }
+        self.session.headers.update(headers)
         
-    def fetch_page(self, url: str) -> Optional[str]:
+    def fetch_page(self, url: str, retry_count: int = 3) -> Optional[str]:
         """
-        Fetch page content using requests with retries.
+        Fetch page content with multiple methods.
         """
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                logger.debug(f"Fetching URL: {url} (attempt {attempt + 1}/{max_retries})")
-                resp = self.session.get(url, timeout=30)
-                
-                if resp.status_code == 200:
-                    # Check if we got meaningful content
-                    if len(resp.text) > 1000:
-                        logger.debug(f"Successfully fetched {url} ({len(resp.text)} bytes)")
-                        return resp.text
-                    else:
-                        logger.warning(f"Response too short: {len(resp.text)} bytes")
-                else:
-                    logger.warning(f"HTTP {resp.status_code} for {url}")
-                
-                # Wait before retry
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                    
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"Request error (attempt {attempt + 1}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                else:
-                    logger.error(f"Failed to fetch {url} after {max_retries} attempts")
+        # Try different methods
+        methods = [
+            self._fetch_with_requests,
+            self._fetch_with_selenium,
+            self._fetch_with_curl
+        ]
+        
+        for method in methods:
+            for attempt in range(retry_count):
+                try:
+                    logger.debug(f"Attempting {method.__name__} for {url} (attempt {attempt + 1})")
+                    content = method(url)
+                    if content and len(content) > 1000:
+                        logger.info(f"✅ Successfully fetched {url} ({len(content)} bytes)")
+                        return content
+                    elif content:
+                        logger.warning(f"Content too short: {len(content)} bytes, retrying...")
+                    time.sleep(random.uniform(1, 3))
+                except Exception as e:
+                    logger.warning(f"Method {method.__name__} failed: {e}")
+                    time.sleep(random.uniform(1, 3))
         
         return None
+    
+    def _fetch_with_requests(self, url: str) -> Optional[str]:
+        """Fetch using requests with anti-bot headers."""
+        self._update_headers()
+        
+        # Add cookies to appear more like a real browser
+        self.session.cookies.set('nlbsession', 'active', domain='.nlb.lk')
+        
+        try:
+            response = self.session.get(url, timeout=30, allow_redirects=True)
+            
+            if response.status_code == 200:
+                # Check if it's a real page or a bot detection page
+                content = response.text
+                if len(content) > 1000 and 'Govisetha' in content:
+                    return content
+                elif 'captcha' in content.lower() or 'bot' in content.lower():
+                    logger.warning("Bot detection triggered, trying different headers...")
+                    # Try with different headers
+                    self.session.headers.update({
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    })
+                    response = self.session.get(url, timeout=30)
+                    if len(response.text) > 1000:
+                        return response.text
+                else:
+                    return content
+            elif response.status_code == 403:
+                logger.warning("Access forbidden (403). Trying different approach...")
+                # Try with different headers
+                self.session.headers.update({
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                })
+                response = self.session.get(url, timeout=30)
+                if len(response.text) > 1000:
+                    return response.text
+        except Exception as e:
+            logger.warning(f"Requests error: {e}")
+        
+        return None
+    
+    def _fetch_with_selenium(self, url: str) -> Optional[str]:
+        """Fetch using Selenium if available."""
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+            from selenium.webdriver.common.by import By
+            from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.webdriver.support import expected_conditions as EC
+            
+            options = Options()
+            options.add_argument('--headless')
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-dev-shm-usage')
+            options.add_argument('--disable-gpu')
+            options.add_argument('--window-size=1920,1080')
+            options.add_argument('--disable-blink-features=AutomationControlled')
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option('useAutomationExtension', False)
+            
+            # Add user agent
+            options.add_argument(f'--user-agent={self.ua.random}')
+            
+            driver = webdriver.Chrome(options=options)
+            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            
+            driver.get(url)
+            time.sleep(3)
+            
+            # Wait for content
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            
+            content = driver.page_source
+            driver.quit()
+            
+            if content and len(content) > 1000:
+                return content
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Selenium error: {e}")
+            return None
+    
+    def _fetch_with_curl(self, url: str) -> Optional[str]:
+        """Fetch using curl command as last resort."""
+        try:
+            import subprocess
+            
+            # Use curl command with browser-like headers
+            curl_command = [
+                'curl', '-s', '-L',
+                '-H', f'User-Agent: {self.ua.random}',
+                '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                '-H', 'Accept-Language: en-US,en;q=0.9',
+                '--connect-timeout', '30',
+                '--max-time', '60',
+                '--retry', '3',
+                url
+            ]
+            
+            result = subprocess.run(curl_command, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0 and result.stdout and len(result.stdout) > 1000:
+                return result.stdout
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Curl error: {e}")
+            return None
 
     def get_latest_draw_number(self) -> Optional[int]:
         """
         Get the latest draw number from the NLB website.
         """
         try:
-            # Try multiple approaches to find latest draw
+            # Try multiple approaches
             approaches = [
                 self._get_latest_from_results_page,
                 self._get_latest_from_homepage,
-                self._get_latest_from_api
+                self._get_latest_from_draws_list,
+                self._get_latest_from_archive
             ]
             
             for approach in approaches:
@@ -101,6 +223,7 @@ class GovisethaAutoUpdater:
                 if result:
                     logger.info(f"Found latest draw number: {result}")
                     return result
+                time.sleep(1)
             
             logger.warning("Could not find latest draw number using any approach")
             return None
@@ -111,46 +234,60 @@ class GovisethaAutoUpdater:
     
     def _get_latest_from_results_page(self) -> Optional[int]:
         """Get latest draw from the results page."""
-        url = f"{self.BASE_URL}/results/{self.LOTTERY_SLUG}"
-        html = self.fetch_page(url)
-        
-        if not html:
-            return None
-        
-        soup = BeautifulSoup(html, 'html.parser')
-        text = soup.get_text(separator=" ", strip=True)
-        
-        # Look for draw numbers with various patterns
-        patterns = [
-            r'(?:Draw|Lottery)\s*(?:No|Number)?\.?\s*:?\s*(\d{3,4})',
-            r'Govisetha\s*(?:Draw|Lottery)?\s*(?:No|Number)?\.?\s*:?\s*(\d{3,4})',
-            r'Draw\s+(\d{3,4})',
-            r'#\s*(\d{3,4})',
-            r'Result\s+(\d{3,4})',
+        urls = [
+            f"{self.BASE_URL}/results/{self.LOTTERY_SLUG}",
+            f"{self.BASE_URL}/results",
+            f"{self.BASE_URL}/lottery-results",
         ]
         
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.I)
-            if matches:
-                # Get the maximum draw number (latest)
-                draw_numbers = [int(m) for m in matches if m.isdigit()]
-                if draw_numbers:
-                    return max(draw_numbers)
-        
-        # Also look in links
-        for link in soup.find_all('a', href=True):
-            href = link['href']
-            match = re.search(r'/results/govisetha/(\d{3,4})', href)
-            if match:
-                return int(match.group(1))
+        for url in urls:
+            html = self.fetch_page(url)
+            if not html:
+                continue
+            
+            soup = BeautifulSoup(html, 'html.parser')
+            text = soup.get_text(separator=" ", strip=True)
+            
+            # Look for draw numbers with various patterns
+            patterns = [
+                r'(?:Draw|Lottery|Result)\s*(?:No|Number)?\.?\s*:?\s*(\d{3,4})',
+                r'Govisetha\s*(?:Draw|Lottery|Result)?\s*(?:No|Number)?\.?\s*:?\s*(\d{3,4})',
+                r'Draw\s+(\d{3,4})',
+                r'#\s*(\d{3,4})',
+                r'Result\s+(\d{3,4})',
+                r'(\d{3,4})\s*(?:th|nd|rd|st)\s*(?:Draw|Lottery)',
+            ]
+            
+            # Search in visible text
+            for pattern in patterns:
+                matches = re.findall(pattern, text, re.I)
+                if matches:
+                    draw_numbers = [int(m) for m in matches if m.isdigit()]
+                    if draw_numbers:
+                        return max(draw_numbers)
+            
+            # Also look in links
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                match = re.search(r'/results/govisetha/(\d{3,4})', href)
+                if match:
+                    return int(match.group(1))
+                
+                match = re.search(r'/govisetha/(\d{3,4})', href)
+                if match:
+                    return int(match.group(1))
+                
+                # Check link text
+                link_text = link.get_text().strip()
+                match = re.search(r'Draw\s*(\d{3,4})', link_text, re.I)
+                if match:
+                    return int(match.group(1))
         
         return None
     
     def _get_latest_from_homepage(self) -> Optional[int]:
         """Try to get latest draw from homepage."""
-        url = f"{self.BASE_URL}"
-        html = self.fetch_page(url)
-        
+        html = self.fetch_page(self.BASE_URL)
         if not html:
             return None
         
@@ -158,6 +295,7 @@ class GovisethaAutoUpdater:
         patterns = [
             r'/results/govisetha/(\d{3,4})',
             r'govisetha/(\d{3,4})',
+            r'/lottery/govisetha/(\d{3,4})',
         ]
         
         for pattern in patterns:
@@ -167,23 +305,60 @@ class GovisethaAutoUpdater:
                 if draw_numbers:
                     return max(draw_numbers)
         
-        return None
-    
-    def _get_latest_from_api(self) -> Optional[int]:
-        """Try to get latest draw from any API endpoints."""
-        # Some sites have hidden API endpoints
-        api_urls = [
-            f"{self.BASE_URL}/api/results/{self.LOTTERY_SLUG}/latest",
-            f"{self.BASE_URL}/api/latest/{self.LOTTERY_SLUG}",
+        # Look for draw number in visible text
+        soup = BeautifulSoup(html, 'html.parser')
+        text = soup.get_text(separator=" ", strip=True)
+        
+        patterns = [
+            r'Latest\s+Draw\s*:?\s*(\d{3,4})',
+            r'Current\s+Draw\s*:?\s*(\d{3,4})',
+            r'Draw\s+No\s*:?\s*(\d{3,4})',
         ]
         
-        for url in api_urls:
+        for pattern in patterns:
+            match = re.search(pattern, text, re.I)
+            if match:
+                return int(match.group(1))
+        
+        return None
+    
+    def _get_latest_from_draws_list(self) -> Optional[int]:
+        """Try to find latest from a list of draws."""
+        # Try to find a page that lists multiple draws
+        urls = [
+            f"{self.BASE_URL}/results/govisetha",
+            f"{self.BASE_URL}/govisetha-results",
+            f"{self.BASE_URL}/previous-draws",
+        ]
+        
+        for url in urls:
+            html = self.fetch_page(url)
+            if not html:
+                continue
+            
+            # Look for all draw numbers in the page
+            draw_numbers = re.findall(r'\b(45\d{2}|46\d{2}|47\d{2})\b', html)
+            if draw_numbers:
+                return max([int(n) for n in draw_numbers])
+        
+        return None
+    
+    def _get_latest_from_archive(self) -> Optional[int]:
+        """Try to get latest from archive or sitemap."""
+        urls = [
+            f"{self.BASE_URL}/sitemap.xml",
+            f"{self.BASE_URL}/sitemap_index.xml",
+        ]
+        
+        for url in urls:
             try:
-                resp = self.session.get(url, timeout=10)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if 'draw_number' in data:
-                        return int(data['draw_number'])
+                response = self.session.get(url, timeout=15)
+                if response.status_code == 200:
+                    content = response.text
+                    # Look for draw numbers in sitemap
+                    matches = re.findall(r'/results/govisetha/(\d{3,4})', content)
+                    if matches:
+                        return max([int(m) for m in matches])
             except:
                 continue
         
@@ -227,23 +402,35 @@ class GovisethaAutoUpdater:
             "found": False
         }
         
-        # Find the draw number in the text
-        draw_pattern = rf'(?:Draw|Lottery)\s*(?:No|Number)?\.?\s*:?\s*{draw_number}'
-        draw_match = re.search(draw_pattern, text, re.I)
+        # First try to find the section with the draw number
+        # Look for the draw number with surrounding context
+        draw_patterns = [
+            rf'(?:Draw|Lottery|Result)\s*(?:No|Number)?\.?\s*:?\s*{draw_number}',
+            rf'{draw_number}\s*(?:th|nd|rd|st)\s*(?:Draw|Lottery)',
+            rf'#{draw_number}',
+        ]
         
-        if not draw_match:
-            # Try with just the number
-            draw_pattern = rf'\b{draw_number}\b'
-            draw_match = re.search(draw_pattern, text)
-            if not draw_match:
+        draw_pos = -1
+        for pattern in draw_patterns:
+            match = re.search(pattern, text, re.I)
+            if match:
+                draw_pos = match.start()
+                break
+        
+        if draw_pos == -1:
+            # Try just the number
+            match = re.search(rf'\b{draw_number}\b', text)
+            if match:
+                draw_pos = match.start()
+            else:
                 return result
         
-        # Get the text around the draw number
-        start = max(0, draw_match.start() - 100)
-        end = min(len(text), draw_match.end() + 400)
+        # Get context around the draw number
+        start = max(0, draw_pos - 200)
+        end = min(len(text), draw_pos + 500)
         section = text[start:end]
         
-        # Pattern: Letter at the start of a sequence, followed by space and 4 numbers
+        # First try: Exact format: S 20 55 57 73
         pattern = r'\b([A-Z])\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\b'
         matches = re.findall(pattern, section, re.I)
         
@@ -258,50 +445,62 @@ class GovisethaAutoUpdater:
                     result["found"] = True
                     return result
         
-        # Try with 3 numbers
-        pattern = r'\b([A-Z])\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\b'
+        # Second try: Letter with 3-4 numbers separated by spaces
+        pattern = r'\b([A-Z])\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})(?:\s+(\d{1,2}))?\b'
         matches = re.findall(pattern, section, re.I)
         
         if matches:
             for match in matches:
                 symbol = match[0]
-                numbers = list(match[1:4])
-                numbers = [n for n in numbers if n and 0 <= int(n) <= 99]
+                numbers = [n for n in match[1:] if n and 0 <= int(n) <= 99]
                 if len(numbers) >= 3:
                     result["symbol"] = symbol
                     result["numbers"] = [f"{int(n):02d}" for n in numbers[:4]]
-                    # Pad with zeros if needed
                     while len(result["numbers"]) < 4:
                         result["numbers"].append("00")
                     result["found"] = True
                     return result
         
-        # More flexible pattern for Govisetha format
-        # Look for letter followed by numbers
-        letter_pattern = r'\b([A-Z])\s+(\d+)\s+(\d+)\s+(\d+)\s*'
-        matches = re.findall(letter_pattern, section, re.I)
+        # Third try: Look for letter followed by numbers anywhere in the section
+        pattern = r'\b([A-Z])\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s*'
+        matches = re.findall(pattern, section, re.I)
         
         if matches:
             for match in matches:
                 symbol = match[0]
-                numbers = [n for n in match[1:4] if n and 0 <= int(n) <= 99]
-                if numbers and len(numbers) >= 3:
+                numbers = [n for n in match[1:] if n and 0 <= int(n) <= 99]
+                if len(numbers) >= 3:
                     result["symbol"] = symbol
                     result["numbers"] = [f"{int(n):02d}" for n in numbers[:4]]
                     while len(result["numbers"]) < 4:
                         result["numbers"].append("00")
                     result["found"] = True
                     return result
+        
+        # Fourth try: Look for numbers near the draw number
+        # Sometimes the format is different
+        numbers_around = re.findall(r'\b(\d{1,2})\b', section)
+        numbers_around = [n for n in numbers_around if 0 <= int(n) <= 99]
+        
+        # Look for a letter before the numbers
+        letter_match = re.search(r'\b([A-Z])\s+', section[:200])
+        if letter_match and len(numbers_around) >= 4:
+            symbol = letter_match.group(1)
+            result["symbol"] = symbol
+            result["numbers"] = [f"{int(n):02d}" for n in numbers_around[:4]]
+            result["found"] = True
+            return result
         
         return result
 
     def extract_draw_date(self, text: str) -> Optional[str]:
         """Extract the draw date from the page."""
         date_patterns = [
-            r'(?:Date|Draw Date)\s*:?\s*([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
+            r'(?:Date|Draw Date|Drawn Date)\s*:?\s*([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
             r'([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
             r'(\d{1,2}\s+[A-Za-z]+\s+\d{4})',
             r'(\d{4}-\d{2}-\d{2})',
+            r'(\d{2}/\d{2}/\d{4})',
         ]
         
         for pattern in date_patterns:
@@ -345,8 +544,9 @@ class GovisethaAutoUpdater:
                 }
             
             # If numbers not found, try looking in specific HTML elements
-            # Look for result tables or containers
-            result_containers = soup.find_all(['div', 'span', 'p'], class_=re.compile(r'result|winning|number', re.I))
+            # Look for result tables or containers with specific classes
+            result_containers = soup.find_all(['div', 'span', 'p', 'td', 'li'], 
+                                            class_=re.compile(r'result|winning|number|draw', re.I))
             
             for container in result_containers:
                 container_text = container.get_text(separator=" ", strip=True)
@@ -361,6 +561,23 @@ class GovisethaAutoUpdater:
                         "url": url,
                         "found": True
                     }
+            
+            # Also check for any element with numbers in it
+            all_elements = soup.find_all(['div', 'span', 'p'])
+            for element in all_elements:
+                element_text = element.get_text(separator=" ", strip=True)
+                if len(element_text) < 200:  # Only check small elements
+                    extracted = self.extract_winning_numbers(element_text, draw_str)
+                    if extracted["found"]:
+                        return {
+                            "lottery": self.LOTTERY_NAME,
+                            "draw_number": draw_str,
+                            "date": date,
+                            "symbol": extracted["symbol"],
+                            "numbers": extracted["numbers"],
+                            "url": url,
+                            "found": True
+                        }
             
             logger.warning(f"No winning numbers found for draw {draw_number}")
             return None
@@ -423,12 +640,12 @@ class GovisethaAutoUpdater:
         
         # Get existing draws from Firebase
         existing_draws = self.get_existing_draws()
-        if not existing_draws:
-            logger.warning("No existing draws found in Firebase. Starting from draw 4534")
-            existing_draws = list(range(4534, min(latest_website + 1, 4540)))
         
-        # Determine the range to check
-        if existing_draws:
+        if not existing_draws:
+            # If no existing draws, start from a known recent draw
+            logger.warning("No existing draws found in Firebase. Starting from draw 4534")
+            start_draw = 4534
+        else:
             latest_firebase = max(existing_draws)
             logger.info(f"Latest draw in Firebase: {latest_firebase}")
             
@@ -437,10 +654,7 @@ class GovisethaAutoUpdater:
                 logger.info("✅ All draws are up to date!")
                 return [], []
             
-            # Start from the next draw after the latest in Firebase
             start_draw = latest_firebase + 1
-        else:
-            start_draw = 4534  # Default start if no data
         
         # Create list of missing draws
         missing_draws = list(range(start_draw, latest_website + 1))
@@ -475,8 +689,8 @@ class GovisethaAutoUpdater:
                     logger.warning(f"❌ Could not fetch draw {draw_num}")
                     failed_draws.append(draw_num)
                 
-                # Small delay between requests
-                time.sleep(1.0)
+                # Random delay between requests
+                time.sleep(random.uniform(1.5, 3.0))
                 
             except Exception as e:
                 logger.error(f"❌ Error processing draw {draw_num}: {e}")
@@ -575,7 +789,7 @@ def initialize_firebase():
 def main():
     """Main function."""
     logger.info("="*70)
-    logger.info("🏆 GOVISETHA AUTO-UPDATER (Selenium-Free)")
+    logger.info("🏆 GOVISETHA AUTO-UPDATER (Enhanced)")
     logger.info("="*70)
     
     # Initialize Firebase
@@ -590,7 +804,7 @@ def main():
     
     try:
         # Run the update check
-        new_draws, failed_draws = updater.check_and_update(max_draws_per_run=5)
+        new_draws, failed_draws = updater.check_and_update(max_draws_per_run=3)
         
         # Print final status
         if new_draws or failed_draws:
