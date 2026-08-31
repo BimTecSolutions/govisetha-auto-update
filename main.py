@@ -8,17 +8,12 @@ import sys
 import time
 import json
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from bs4 import BeautifulSoup
 import re
 import firebase_admin
 from firebase_admin import credentials, firestore
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 import logging
 
 # Configure logging
@@ -48,109 +43,151 @@ class GovisethaAutoUpdater:
         self.firestore_client = firestore_client
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
         })
-        self._driver = None
-        self.use_selenium = True
         
-    def _get_driver(self):
-        """Initialize and return Selenium driver."""
-        if self._driver is None:
-            try:
-                chrome_options = Options()
-                chrome_options.add_argument('--headless')
-                chrome_options.add_argument('--no-sandbox')
-                chrome_options.add_argument('--disable-dev-shm-usage')
-                chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-                chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-                chrome_options.add_experimental_option('useAutomationExtension', False)
-                chrome_options.add_argument('--disable-gpu')
-                chrome_options.add_argument('--window-size=1920,1080')
-                self._driver = webdriver.Chrome(options=chrome_options)
-                logger.info("✅ Selenium driver initialized successfully")
-            except Exception as e:
-                logger.warning(f"⚠️ Selenium init error: {e}")
-                self.use_selenium = False
-        return self._driver
-
     def fetch_page(self, url: str) -> Optional[str]:
-        """Fetch page content using Selenium or requests."""
-        if self.use_selenium:
-            driver = self._get_driver()
-            if driver:
-                try:
-                    driver.get(url)
-                    time.sleep(2)
-                    WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.TAG_NAME, "body"))
-                    )
-                    return driver.page_source
-                except Exception as e:
-                    logger.warning(f"⚠️ Selenium error: {e}")
+        """
+        Fetch page content using requests with retries.
+        """
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                logger.debug(f"Fetching URL: {url} (attempt {attempt + 1}/{max_retries})")
+                resp = self.session.get(url, timeout=30)
+                
+                if resp.status_code == 200:
+                    # Check if we got meaningful content
+                    if len(resp.text) > 1000:
+                        logger.debug(f"Successfully fetched {url} ({len(resp.text)} bytes)")
+                        return resp.text
+                    else:
+                        logger.warning(f"Response too short: {len(resp.text)} bytes")
+                else:
+                    logger.warning(f"HTTP {resp.status_code} for {url}")
+                
+                # Wait before retry
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                    
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Request error (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    logger.error(f"Failed to fetch {url} after {max_retries} attempts")
         
-        # Fallback to requests
-        try:
-            resp = self.session.get(url, timeout=30)
-            if resp.status_code == 200 and len(resp.text) > 1000:
-                return resp.text
-        except Exception as e:
-            logger.warning(f"⚠️ Request error: {e}")
         return None
 
     def get_latest_draw_number(self) -> Optional[int]:
         """
         Get the latest draw number from the NLB website.
-        Looks for the most recent draw in the results page.
         """
         try:
-            # Visit the results page to find latest draw
-            url = f"{self.BASE_URL}/results/{self.LOTTERY_SLUG}"
-            html = self.fetch_page(url)
-            
-            if not html:
-                logger.error("Failed to fetch results page")
-                return None
-            
-            soup = BeautifulSoup(html, 'html.parser')
-            text = soup.get_text(separator=" ", strip=True)
-            
-            # Look for draw numbers with pattern: Draw No: 4537 or similar
-            patterns = [
-                r'(?:Draw|Lottery)\s*(?:No|Number)?\.?\s*:?\s*(\d+)',
-                r'Govisetha\s*(?:Draw|Lottery)\s*(?:No|Number)?\.?\s*:?\s*(\d+)',
-                r'Draw\s+(\d+)',
-                r'#\s*(\d{3,4})',
+            # Try multiple approaches to find latest draw
+            approaches = [
+                self._get_latest_from_results_page,
+                self._get_latest_from_homepage,
+                self._get_latest_from_api
             ]
             
-            all_draws = []
-            for pattern in patterns:
-                matches = re.findall(pattern, text, re.I)
-                all_draws.extend([int(m) for m in matches if m.isdigit()])
+            for approach in approaches:
+                result = approach()
+                if result:
+                    logger.info(f"Found latest draw number: {result}")
+                    return result
             
-            # Also look for draw numbers in URLs
-            url_patterns = [
-                r'/results/govisetha/(\d+)',
-                r'govisetha/(\d+)',
-            ]
-            
-            for pattern in url_patterns:
-                matches = re.findall(pattern, html, re.I)
-                all_draws.extend([int(m) for m in matches if m.isdigit()])
-            
-            if all_draws:
-                # Get the maximum draw number
-                latest = max(all_draws)
-                logger.info(f"Found latest draw number: {latest}")
-                return latest
-            
-            logger.warning("Could not find any draw numbers on the page")
+            logger.warning("Could not find latest draw number using any approach")
             return None
             
         except Exception as e:
             logger.error(f"Error getting latest draw: {e}")
             return None
+    
+    def _get_latest_from_results_page(self) -> Optional[int]:
+        """Get latest draw from the results page."""
+        url = f"{self.BASE_URL}/results/{self.LOTTERY_SLUG}"
+        html = self.fetch_page(url)
+        
+        if not html:
+            return None
+        
+        soup = BeautifulSoup(html, 'html.parser')
+        text = soup.get_text(separator=" ", strip=True)
+        
+        # Look for draw numbers with various patterns
+        patterns = [
+            r'(?:Draw|Lottery)\s*(?:No|Number)?\.?\s*:?\s*(\d{3,4})',
+            r'Govisetha\s*(?:Draw|Lottery)?\s*(?:No|Number)?\.?\s*:?\s*(\d{3,4})',
+            r'Draw\s+(\d{3,4})',
+            r'#\s*(\d{3,4})',
+            r'Result\s+(\d{3,4})',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.I)
+            if matches:
+                # Get the maximum draw number (latest)
+                draw_numbers = [int(m) for m in matches if m.isdigit()]
+                if draw_numbers:
+                    return max(draw_numbers)
+        
+        # Also look in links
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            match = re.search(r'/results/govisetha/(\d{3,4})', href)
+            if match:
+                return int(match.group(1))
+        
+        return None
+    
+    def _get_latest_from_homepage(self) -> Optional[int]:
+        """Try to get latest draw from homepage."""
+        url = f"{self.BASE_URL}"
+        html = self.fetch_page(url)
+        
+        if not html:
+            return None
+        
+        # Look for links to recent results
+        patterns = [
+            r'/results/govisetha/(\d{3,4})',
+            r'govisetha/(\d{3,4})',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, html, re.I)
+            if matches:
+                draw_numbers = [int(m) for m in matches if m.isdigit()]
+                if draw_numbers:
+                    return max(draw_numbers)
+        
+        return None
+    
+    def _get_latest_from_api(self) -> Optional[int]:
+        """Try to get latest draw from any API endpoints."""
+        # Some sites have hidden API endpoints
+        api_urls = [
+            f"{self.BASE_URL}/api/results/{self.LOTTERY_SLUG}/latest",
+            f"{self.BASE_URL}/api/latest/{self.LOTTERY_SLUG}",
+        ]
+        
+        for url in api_urls:
+            try:
+                resp = self.session.get(url, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if 'draw_number' in data:
+                        return int(data['draw_number'])
+            except:
+                continue
+        
+        return None
 
     def get_existing_draws(self) -> List[int]:
         """Get all existing draw numbers from Firestore."""
@@ -159,17 +196,21 @@ class GovisethaAutoUpdater:
             return []
         
         try:
-            doc_ref = self.firestore_client.collection(
+            subcollection_ref = self.firestore_client.collection(
                 self.COLLECTION_NAME
-            ).document(self.SUBSELECTION_NAME)
+            ).document(self.SUBSELECTION_NAME).collection(self.SUBSELECTION_NAME)
             
-            subcollection_ref = doc_ref.collection(self.SUBSELECTION_NAME)
+            # Get all documents
             docs = subcollection_ref.stream()
             
             draw_numbers = []
             for doc in docs:
-                if 'draw_number' in doc.to_dict():
-                    draw_numbers.append(int(doc.to_dict()['draw_number']))
+                doc_data = doc.to_dict()
+                if doc_data and 'draw_number' in doc_data:
+                    try:
+                        draw_numbers.append(int(doc_data['draw_number']))
+                    except (ValueError, TypeError):
+                        continue
             
             logger.info(f"Found {len(draw_numbers)} existing draws in Firebase")
             return draw_numbers
@@ -179,9 +220,7 @@ class GovisethaAutoUpdater:
             return []
 
     def extract_winning_numbers(self, text: str, draw_number: str) -> Dict:
-        """
-        Extract winning numbers for a specific draw number.
-        """
+        """Extract winning numbers for a specific draw number."""
         result = {
             "symbol": None,
             "numbers": [],
@@ -193,39 +232,64 @@ class GovisethaAutoUpdater:
         draw_match = re.search(draw_pattern, text, re.I)
         
         if not draw_match:
-            return result
+            # Try with just the number
+            draw_pattern = rf'\b{draw_number}\b'
+            draw_match = re.search(draw_pattern, text)
+            if not draw_match:
+                return result
         
-        # Get the text after the draw number
-        start = draw_match.end()
-        section = text[start:start + 300]
+        # Get the text around the draw number
+        start = max(0, draw_match.start() - 100)
+        end = min(len(text), draw_match.end() + 400)
+        section = text[start:end]
         
         # Pattern: Letter at the start of a sequence, followed by space and 4 numbers
-        pattern = r'\b([A-Z])\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\b'
+        pattern = r'\b([A-Z])\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\b'
         matches = re.findall(pattern, section, re.I)
         
         if matches:
             for match in matches:
                 symbol = match[0]
                 numbers = list(match[1:5])
-                numbers = [n for n in numbers if 0 <= int(n) <= 99]
+                numbers = [n for n in numbers if n and 0 <= int(n) <= 99]
                 if len(numbers) == 4:
                     result["symbol"] = symbol
                     result["numbers"] = [f"{int(n):02d}" for n in numbers]
                     result["found"] = True
                     return result
         
-        # Try with 3-5 numbers
-        pattern = r'\b([A-Z])\s+(\d+)\s+(\d+)\s+(\d+)(?:\s+(\d+))?(?:\s+(\d+))?\b'
+        # Try with 3 numbers
+        pattern = r'\b([A-Z])\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\b'
         matches = re.findall(pattern, section, re.I)
         
         if matches:
             for match in matches:
                 symbol = match[0]
-                numbers = list(match[1:])
+                numbers = list(match[1:4])
                 numbers = [n for n in numbers if n and 0 <= int(n) <= 99]
+                if len(numbers) >= 3:
+                    result["symbol"] = symbol
+                    result["numbers"] = [f"{int(n):02d}" for n in numbers[:4]]
+                    # Pad with zeros if needed
+                    while len(result["numbers"]) < 4:
+                        result["numbers"].append("00")
+                    result["found"] = True
+                    return result
+        
+        # More flexible pattern for Govisetha format
+        # Look for letter followed by numbers
+        letter_pattern = r'\b([A-Z])\s+(\d+)\s+(\d+)\s+(\d+)\s*'
+        matches = re.findall(letter_pattern, section, re.I)
+        
+        if matches:
+            for match in matches:
+                symbol = match[0]
+                numbers = [n for n in match[1:4] if n and 0 <= int(n) <= 99]
                 if numbers and len(numbers) >= 3:
                     result["symbol"] = symbol
                     result["numbers"] = [f"{int(n):02d}" for n in numbers[:4]]
+                    while len(result["numbers"]) < 4:
+                        result["numbers"].append("00")
                     result["found"] = True
                     return result
         
@@ -236,18 +300,18 @@ class GovisethaAutoUpdater:
         date_patterns = [
             r'(?:Date|Draw Date)\s*:?\s*([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
             r'([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
+            r'(\d{1,2}\s+[A-Za-z]+\s+\d{4})',
+            r'(\d{4}-\d{2}-\d{2})',
         ]
         
         for pattern in date_patterns:
             match = re.search(pattern, text, re.I)
             if match:
-                return match.group(1)
+                return match.group(1).strip()
         return None
 
     def fetch_draw_result(self, draw_number: int) -> Optional[Dict]:
-        """
-        Fetch and parse results for a specific draw number.
-        """
+        """Fetch and parse results for a specific draw number."""
         draw_str = str(draw_number)
         url = f"{self.BASE_URL}/results/{self.LOTTERY_SLUG}/{draw_str}"
         
@@ -258,28 +322,52 @@ class GovisethaAutoUpdater:
             logger.warning(f"Failed to fetch draw {draw_number}")
             return None
         
-        # Parse the HTML
-        soup = BeautifulSoup(html, 'html.parser')
-        all_text = soup.get_text(separator=" ", strip=True)
-        
-        # Extract date
-        date = self.extract_draw_date(all_text)
-        
-        # Extract winning numbers
-        extracted = self.extract_winning_numbers(all_text, draw_str)
-        
-        if extracted["found"]:
-            return {
-                "lottery": self.LOTTERY_NAME,
-                "draw_number": draw_str,
-                "date": date,
-                "symbol": extracted["symbol"],
-                "numbers": extracted["numbers"],
-                "url": url,
-                "found": True
-            }
-        
-        return None
+        try:
+            # Parse the HTML
+            soup = BeautifulSoup(html, 'html.parser')
+            all_text = soup.get_text(separator=" ", strip=True)
+            
+            # Extract date
+            date = self.extract_draw_date(all_text)
+            
+            # Extract winning numbers
+            extracted = self.extract_winning_numbers(all_text, draw_str)
+            
+            if extracted["found"]:
+                return {
+                    "lottery": self.LOTTERY_NAME,
+                    "draw_number": draw_str,
+                    "date": date,
+                    "symbol": extracted["symbol"],
+                    "numbers": extracted["numbers"],
+                    "url": url,
+                    "found": True
+                }
+            
+            # If numbers not found, try looking in specific HTML elements
+            # Look for result tables or containers
+            result_containers = soup.find_all(['div', 'span', 'p'], class_=re.compile(r'result|winning|number', re.I))
+            
+            for container in result_containers:
+                container_text = container.get_text(separator=" ", strip=True)
+                extracted = self.extract_winning_numbers(container_text, draw_str)
+                if extracted["found"]:
+                    return {
+                        "lottery": self.LOTTERY_NAME,
+                        "draw_number": draw_str,
+                        "date": date,
+                        "symbol": extracted["symbol"],
+                        "numbers": extracted["numbers"],
+                        "url": url,
+                        "found": True
+                    }
+            
+            logger.warning(f"No winning numbers found for draw {draw_number}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error parsing draw {draw_number}: {e}")
+            return None
 
     def save_to_firestore(self, result: Dict) -> bool:
         """Save a single result to Firestore."""
@@ -319,13 +407,8 @@ class GovisethaAutoUpdater:
             logger.error(f"❌ Error saving draw {draw_number}: {e}")
             return False
 
-    def check_and_update(self, max_draws_per_run: int = 10) -> Tuple[List[int], List[int]]:
-        """
-        Check for new draws and update Firebase.
-        
-        Returns:
-            Tuple of (new_draws_added, failed_draws)
-        """
+    def check_and_update(self, max_draws_per_run: int = 5) -> Tuple[List[int], List[int]]:
+        """Check for new draws and update Firebase."""
         logger.info("="*70)
         logger.info("🚀 Starting Govisetha Auto-Update Check")
         logger.info("="*70)
@@ -336,23 +419,38 @@ class GovisethaAutoUpdater:
             logger.error("Failed to get latest draw number from website")
             return [], []
         
+        logger.info(f"Latest draw on website: {latest_website}")
+        
         # Get existing draws from Firebase
         existing_draws = self.get_existing_draws()
         if not existing_draws:
-            # If no existing draws, this might be first run
-            # We'll start from a reasonable point
             logger.warning("No existing draws found in Firebase. Starting from draw 4534")
-            existing_draws = list(range(4534, latest_website + 1))
+            existing_draws = list(range(4534, min(latest_website + 1, 4540)))
         
-        # Find missing draws
-        missing_draws = sorted(set(range(min(existing_draws), latest_website + 1)) - set(existing_draws))
+        # Determine the range to check
+        if existing_draws:
+            latest_firebase = max(existing_draws)
+            logger.info(f"Latest draw in Firebase: {latest_firebase}")
+            
+            # If we already have the latest, nothing to do
+            if latest_firebase >= latest_website:
+                logger.info("✅ All draws are up to date!")
+                return [], []
+            
+            # Start from the next draw after the latest in Firebase
+            start_draw = latest_firebase + 1
+        else:
+            start_draw = 4534  # Default start if no data
+        
+        # Create list of missing draws
+        missing_draws = list(range(start_draw, latest_website + 1))
         
         if not missing_draws:
             logger.info("✅ No new draws to update. All draws are up to date!")
             return [], []
         
         logger.info(f"📊 Found {len(missing_draws)} new draws to add")
-        logger.info(f"   Missing draws: {missing_draws[:10]}{'...' if len(missing_draws) > 10 else ''}")
+        logger.info(f"   Range: {missing_draws[0]} to {missing_draws[-1]}")
         
         # Limit the number of draws per run
         if len(missing_draws) > max_draws_per_run:
@@ -378,7 +476,7 @@ class GovisethaAutoUpdater:
                     failed_draws.append(draw_num)
                 
                 # Small delay between requests
-                time.sleep(0.5)
+                time.sleep(1.0)
                 
             except Exception as e:
                 logger.error(f"❌ Error processing draw {draw_num}: {e}")
@@ -438,19 +536,11 @@ class GovisethaAutoUpdater:
 
     def cleanup(self):
         """Clean up resources."""
-        if self._driver:
-            try:
-                self._driver.quit()
-                logger.info("Selenium driver closed")
-            except:
-                pass
-            self._driver = None
+        pass
 
 
 def initialize_firebase():
-    """
-    Initialize Firebase with credentials from environment variable.
-    """
+    """Initialize Firebase with credentials from environment variable."""
     try:
         # Get credentials from environment variable
         cred_json = os.environ.get('FIREBASE_CREDENTIALS')
@@ -485,7 +575,7 @@ def initialize_firebase():
 def main():
     """Main function."""
     logger.info("="*70)
-    logger.info("🏆 GOVISETHA AUTO-UPDATER")
+    logger.info("🏆 GOVISETHA AUTO-UPDATER (Selenium-Free)")
     logger.info("="*70)
     
     # Initialize Firebase
@@ -500,7 +590,6 @@ def main():
     
     try:
         # Run the update check
-        # Limit to 5 new draws per run to avoid rate limiting
         new_draws, failed_draws = updater.check_and_update(max_draws_per_run=5)
         
         # Print final status
@@ -511,6 +600,8 @@ def main():
         else:
             logger.info("\n✅ No updates needed. All draws are up to date!")
         
+        return 0 if not failed_draws else 1
+        
     except Exception as e:
         logger.error(f"❌ Unexpected error: {e}")
         return 1
@@ -519,8 +610,6 @@ def main():
         logger.info("\n" + "="*70)
         logger.info("PROGRAM COMPLETE")
         logger.info("="*70)
-    
-    return 0
 
 
 if __name__ == "__main__":
