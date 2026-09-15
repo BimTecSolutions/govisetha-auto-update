@@ -1,4 +1,4 @@
-```python
+
 """
 Govisetha Lottery Auto-Update Script
 
@@ -1746,4 +1746,4 @@ if __name__ == "__main__":
     sys.exit(
         main()
     )
-```
+
