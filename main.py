@@ -1,4 +1,3 @@
-
 """
 Govisetha Lottery Auto-Update Script
 
@@ -369,6 +368,64 @@ class GovisethaAutoUpdater:
         )
 
         return None
+
+    # ------------------------------------------------------------------------
+    # DATE HELPERS
+    # ------------------------------------------------------------------------
+
+    @staticmethod
+    def convert_date_to_iso(date_str: Optional[str]) -> str:
+        """
+        Convert an NLB date string to ISO format (YYYY-MM-DD).
+
+        Handles both formats seen on the site:
+
+            "Monday September 14, 2026"
+            "September 14, 2026"
+
+        Returns "" if the date cannot be parsed.
+        """
+
+        if not date_str:
+            return ""
+
+        cleaned = date_str.strip()
+
+        # Try with a leading weekday name first.
+        formats = [
+            "%A %B %d, %Y",   # Monday September 14, 2026
+            "%B %d, %Y",      # September 14, 2026
+        ]
+
+        for fmt in formats:
+
+            try:
+                dt = datetime.strptime(cleaned, fmt)
+                return dt.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+
+        # Last resort: strip a leading weekday word and retry.
+        stripped = re.sub(
+            r"^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE
+        )
+
+        if stripped != cleaned:
+
+            try:
+                dt = datetime.strptime(stripped, "%B %d, %Y")
+                return dt.strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+
+        logger.warning(
+            f"⚠️ Could not parse date for ISO conversion: {date_str!r}"
+        )
+
+        return ""
 
     # ------------------------------------------------------------------------
     # GET LATEST DRAW
@@ -761,6 +818,7 @@ class GovisethaAutoUpdater:
                 "lottery": self.LOTTERY_NAME,
                 "draw_number": str(draw_number),
                 "date": date,
+                "date_iso": self.convert_date_to_iso(date),
                 "symbol": symbol,
                 "numbers": numbers,
                 "found": True,
@@ -909,6 +967,7 @@ class GovisethaAutoUpdater:
                             "lottery": self.LOTTERY_NAME,
                             "draw_number": str(draw_number),
                             "date": date,
+                            "date_iso": self.convert_date_to_iso(date),
                             "symbol": symbol,
                             "numbers": numbers,
                             "found": True,
@@ -1036,6 +1095,11 @@ class GovisethaAutoUpdater:
                 f"{self.LOTTERY_SLUG}-{draw_number}"
             )
 
+            date_value = result.get(
+                "date",
+                ""
+            )
+
             firestore_data = {
                 "lottery": result.get(
                     "lottery",
@@ -1044,9 +1108,15 @@ class GovisethaAutoUpdater:
 
                 "draw_number": draw_number,
 
-                "date": result.get(
-                    "date",
-                    ""
+                # Kept for backward compatibility / cross-lottery
+                # sorting, mirroring the other lottery scrapers.
+                "draw_number_int": int(draw_number),
+
+                "date": date_value,
+
+                "date_iso": result.get(
+                    "date_iso",
+                    self.convert_date_to_iso(date_value)
                 ),
 
                 "symbol": result.get(
@@ -1536,53 +1606,81 @@ class GovisethaAutoUpdater:
 
 def initialize_firebase():
     """
-    Initialize Firebase using FIREBASE_CREDENTIALS environment variable.
+    Initialize Firebase.
 
-    The GitHub Actions secret should contain the complete Firebase
-    service-account JSON.
+    Supports two ways of providing credentials, in this order:
+
+        1. FIREBASE_CREDENTIALS env var containing the full
+           service-account JSON as a string (GitHub Actions secret).
+        2. GOOGLE_APPLICATION_CREDENTIALS env var pointing to a
+           credentials file on disk (local runs).
     """
 
     try:
+
+        cred = None
 
         cred_json = os.environ.get(
             "FIREBASE_CREDENTIALS"
         )
 
-        if not cred_json:
+        if cred_json:
 
-            logger.error(
-                "❌ FIREBASE_CREDENTIALS environment "
-                "variable not found."
-            )
+            try:
 
-            logger.error(
-                "Please check your GitHub Secrets."
-            )
+                cred_dict = json.loads(
+                    cred_json
+                )
 
-            return None
+            except json.JSONDecodeError as e:
 
-        # Parse credentials JSON.
-        try:
+                logger.error(
+                    f"❌ Failed to parse "
+                    f"FIREBASE_CREDENTIALS JSON: {e}"
+                )
 
-            cred_dict = json.loads(
-                cred_json
-            )
-
-        except json.JSONDecodeError as e:
-
-            logger.error(
-                f"❌ Failed to parse "
-                f"FIREBASE_CREDENTIALS JSON: {e}"
-            )
-
-            return None
-
-        # Initialize Firebase only once.
-        if not firebase_admin._apps:
+                return None
 
             cred = credentials.Certificate(
                 cred_dict
             )
+
+        else:
+
+            cred_path = os.environ.get(
+                "GOOGLE_APPLICATION_CREDENTIALS"
+            )
+
+            if not cred_path:
+
+                logger.error(
+                    "❌ Neither FIREBASE_CREDENTIALS nor "
+                    "GOOGLE_APPLICATION_CREDENTIALS "
+                    "environment variable was found."
+                )
+
+                logger.error(
+                    "Please check your GitHub Secrets "
+                    "or local environment."
+                )
+
+                return None
+
+            if not os.path.exists(cred_path):
+
+                logger.error(
+                    f"❌ Credentials file not found: "
+                    f"{cred_path}"
+                )
+
+                return None
+
+            cred = credentials.Certificate(
+                cred_path
+            )
+
+        # Initialize Firebase only once.
+        if not firebase_admin._apps:
 
             firebase_admin.initialize_app(
                 cred
@@ -1746,4 +1844,3 @@ if __name__ == "__main__":
     sys.exit(
         main()
     )
-
